@@ -1,0 +1,1231 @@
+---
+title: "Main_RQ"
+author: "Jiani"
+format: html
+editor: visual
+---
+
+```{r Data and Preprocessing}
+
+pacman::p_load(tidyverse, quanteda, quanteda.corpora, quanteda.textstats, quanteda.textmodels,rjson, caret, glmnet, topicmodels, stm, quanteda.textplots, patchwork, ggplot)
+
+## Data and Preprocessing
+
+cbs <- read.csv("/Users/jenniezhao/Dev/PPOL6081/data/CBS_dataset_v1.0.csv")
+names(cbs)
+
+cbs_filtered <- cbs %>%
+  filter(Language == "English" &
+         Date >= as.Date("2015-01-01") &
+         Date <= as.Date("2025-12-31"))%>%
+  select(Title, Subtitle, Date, Authorname, Role, Gender, text)
+
+cbs_gender <- cbs_filtered %>%
+  filter(Gender %in% c("Female", "Male")) %>%
+  select(text, Gender)
+
+table(cbs_gender$Gender)
+
+```
+
+## **RQ1: Do male and female central bankers use systematically different language when discussing monetary policy decisions?**
+
+**Supervised classifiers (Naive Bayes, LASSO, Ridge)**
+
+```{r Q1 Supervised classifiers}
+## -------------------------------
+## Supervised gender classification
+## Naive Bayes, LASSO, Ridge
+## -------------------------------
+
+set.seed(321)
+
+# Helper: compute confusion matrix
+eval_model <- function(y_true, y_pred) {
+  tab <- table(Actual = y_true, Predicted = y_pred)
+  confusionMatrix(tab, mode = "everything")
+}
+
+## 1. Naive Bayes -----------------------------------------------------------
+
+nb_model <- textmodel_nb(
+  x     = train_dfm,
+  y     = train_set$Gender,
+  smooth = 1,
+  prior  = "uniform"
+)
+
+nb_pred <- predict(nb_model, newdata = test_dfm)
+nb_cmat <- eval_model(test_set$Gender, nb_pred)
+
+
+## 2. LASSO logistic regression (alpha = 1) --------------------------------
+
+fit_glmnet <- function(alpha_value) {
+  cv.glmnet(
+    x = as.matrix(train_dfm),
+    y = factor(train_set$Gender),
+    family = "binomial",
+    alpha = alpha_value,
+    nfolds = 5,
+    type.measure = "class"
+  )
+}
+
+lasso_model <- fit_glmnet(alpha_value = 1)
+lasso_pred  <- predict(lasso_model,
+                       newx = as.matrix(test_dfm),
+                       type = "class")
+lasso_cmat  <- eval_model(test_set$Gender, lasso_pred)
+
+
+## 3. Ridge logistic regression (alpha = 0) --------------------------------
+
+ridge_model <- fit_glmnet(alpha_value = 0)
+ridge_pred  <- predict(ridge_model,
+                       newx = as.matrix(test_dfm),
+                       type = "class")
+ridge_cmat  <- eval_model(test_set$Gender, ridge_pred)
+
+
+## 4. Quick comparison of accuracies ---------------------------------------
+
+nb_cmat$overall["Accuracy"]
+lasso_cmat$overall["Accuracy"]
+ridge_cmat$overall["Accuracy"]
+
+# If you want the class-wise precision/recall for Female:
+nb_cmat$byClass["Pos Pred Value"]    # precision for positive class
+nb_cmat$byClass["Sensitivity"]      # recall for positive class
+
+lasso_cmat$byClass[c("Pos Pred Value", "Sensitivity")]
+ridge_cmat$byClass[c("Pos Pred Value", "Sensitivity")]
+
+```
+
+Because Ridge correctly identifies gender in \~85% of speeches using only text features, this provides strong evidence that male and female central bankers use systematically different language. Classic bag-of-words features alone contain enough information for the model to reliably distinguish genders.
+
+**Topic modeling (STM)**
+
+```{r Q1 STM}
+## ------------------------------------------------------
+## Topic model (STM) and topic-based gender classification
+## ------------------------------------------------------
+
+set.seed(321)
+
+# Train/test split on the full data
+prop_train <- 0.8
+ids        <- 1:nrow(cbs_gender)
+ids_train  <- sample(ids, ceiling(prop_train * length(ids)))
+ids_test   <- setdiff(ids, ids_train)
+
+train_cbs <- cbs_gender[ids_train, ]
+test_cbs  <- cbs_gender[ids_test, ]
+
+## 1. Preprocess text and build dfm (training only) ------------------------
+
+tokens_train <- tokens(
+  train_cbs$text,
+  remove_punct   = TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE,
+  remove_url     = TRUE
+) |>
+  tokens_tolower() |>
+  tokens_remove(c(stopwords("en"),
+                  "bank", "central", "speech", "slides", "thank"))
+
+dfm_train <- dfm(tokens_train) |>
+  dfm_trim(min_docfreq = 0.01,
+           max_docfreq = 0.90,
+           docfreq_type = "prop")
+
+# Convert to STM format
+dfm_train_stm      <- convert(dfm_train, to = "stm")
+dfm_train_stm$meta <- data.frame(Gender = train_cbs$Gender)
+
+## 2. Fit STM with K = 10 topics, prevalence ~ Gender ----------------------
+
+stm_train <- stm(
+  documents  = dfm_train_stm$documents,
+  vocab      = dfm_train_stm$vocab,
+  data       = dfm_train_stm$meta,
+  K          = 10,
+  prevalence = ~ Gender,
+  init.type  = "Spectral"
+)
+
+# Inspect topics and gender effects (for interpretation)
+labelTopics(stm_train)
+topic_effects <- estimateEffect(1:10 ~ Gender,
+                                stm_train,
+                                meta = dfm_train_stm$meta,
+                                uncertainty = "Global")
+summary(topic_effects)
+
+plot(
+  topic_effects,
+  covariate  = "Gender",
+  method     = "difference",
+  cov.value1 = "Female",
+  cov.value2 = "Male",
+  model      = stm_train,
+  xlab       = "Topic more discussed by Female  ←  →  Male",
+  main       = "Gender Differences in Topic Prevalence",
+  labeltype  = "custom",
+  custom.labels = c(
+    "Development", "Inflation", "Climate Finance", "Fed Policy",
+    "Society", "Markets", "Supervision", "Fintech", "Eurozone", "Monetary"
+  )
+)
+
+## 3. Predict topics for test set ------------------------------------------
+
+tokens_test <- tokens(
+  test_cbs$text,
+  remove_punct   = TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE,
+  remove_url     = TRUE
+) |>
+  tokens_tolower() |>
+  tokens_remove(c(stopwords("en"),
+                  "bank", "central", "speech", "slides", "thank"))
+
+dfm_test <- dfm(tokens_test)
+dfm_test <- dfm_match(dfm_test, features = featnames(dfm_train))
+
+dfm_test_stm      <- convert(dfm_test, to = "stm")
+dfm_test_stm$meta <- data.frame(Gender = test_cbs$Gender)
+
+stm_test_pred <- fitNewDocuments(
+  stm_train,
+  documents = dfm_test_stm$documents,
+  newData   = dfm_test_stm$meta,
+  origData  = dfm_train_stm$meta
+)
+
+theta_train <- stm_train$theta               # topic proportions for train
+theta_test  <- stm_test_pred$theta           # topic proportions for test
+
+## 4. Topic-based classifier (logistic regression on theta) ----------------
+
+theta_train_df <- as.data.frame(theta_train)
+theta_train_df$Gender <- train_cbs$Gender
+
+theta_test_df <- as.data.frame(theta_test)
+theta_test_df$Gender <- test_cbs$Gender
+
+# Fit logistic regression: Gender ~ topics
+topic_clf <- glm(Gender ~ .,
+                 data   = theta_train_df,
+                 family = "binomial")
+
+# Predict on test set
+topic_prob <- predict(topic_clf, newdata = theta_test_df, type = "response")
+topic_pred <- ifelse(topic_prob > 0.5, "Female", "Male")
+
+topic_cmat <- eval_model(test_cbs$Gender, topic_pred)
+topic_cmat$overall["Accuracy"]
+topic_cmat$byClass[c("Pos Pred Value", "Sensitivity")]
+
+```
+
+**Word-frequency comparison + keyness analysis**
+
+```{r Q1 Word-frequency comparison + keyness analysis}
+## ----------------------------------------------
+## RQ1: Word-frequency comparison + keyness
+## ----------------------------------------------
+
+library(quanteda)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+set.seed(321)
+
+# 1. Tokenize all speeches and build dfm -----------------------------
+
+tokens_all <- tokens(
+  cbs_gender$text,
+  remove_punct   = TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE,
+  remove_url     = TRUE
+) |>
+  tokens_tolower() |>
+  tokens_remove(stopwords("en")) |>
+  tokens_remove(c("’", "‘", "—", "–", "”", "“", "•")) |>
+  tokens_wordstem(language = "en")
+
+dfm_all <- dfm(tokens_all)
+
+# Group by gender to get aggregate word counts
+dfm_gender <- dfm_group(dfm_all, groups = cbs_gender$Gender)
+
+
+# 2. Keyness: most distinctive words by gender ----------------------
+
+# target = TRUE for Female speeches
+key_gender <- textstat_keyness(dfm_all, target = cbs_gender$Gender == "Female")
+
+top30 <- key_gender |>
+  slice_max(order_by = abs(chi2), n = 30) |>
+  mutate(direction = if_else(chi2 > 0, "Female", "Male"))
+
+p_keyness <- ggplot(
+  top30,
+  aes(x = reorder(feature, chi2),
+      y = chi2,
+      fill = direction)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Most Distinctive Words by Gender",
+    x = "Word",
+    y = "Keyness (χ²)",
+    fill = ""
+  ) +
+  scale_fill_manual(values = c("Female" = "purple", "Male" = "steelblue")) +
+  theme_minimal()
+
+p_keyness
+
+
+# 3. Normalized frequency differences (Female − Male) ----------------
+
+dfm_gender_prop <- dfm_weight(dfm_gender, scheme = "prop")
+
+freq_gender <- convert(dfm_gender_prop, to = "data.frame") |>
+  pivot_longer(cols = -doc_id,
+               names_to  = "word",
+               values_to = "prop") |>
+  rename(Gender = doc_id)
+
+freq_compare <- freq_gender |>
+  pivot_wider(
+    names_from  = Gender,
+    values_from = prop,
+    values_fill = 0
+  ) |>
+  rename(Female = Female, Male = Male) |>
+  mutate(diff = Female - Male)   # positive = more used by Female
+
+top_female_words <- freq_compare |>
+  arrange(desc(diff)) |>
+  slice_head(n = 20)
+
+top_male_words <- freq_compare |>
+  arrange(diff) |>
+  slice_head(n = 20)
+
+p_female <- ggplot(top_female_words,
+                   aes(x = reorder(word, diff), y = diff)) +
+  geom_col(fill = "purple") +
+  coord_flip() +
+  labs(
+    title = "Words Used More Frequently by Female Central Bankers",
+    x = "Word",
+    y = "Difference in normalized frequency (Female − Male)"
+  ) +
+  theme_minimal()
+
+p_male <- ggplot(top_male_words,
+                 aes(x = reorder(word, -diff), y = -diff)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Words Used More Frequently by Male Central Bankers",
+    x = "Word",
+    y = "Difference in normalized frequency (Male − Female)"
+  ) +
+  theme_minimal()
+
+# Show side-by-side comparison
+p_female + p_male
+
+ggsave(
+  filename = "output/fig_keyness_gender.pdf",
+  plot     = p_keyness,
+  width    = 8,
+  height   = 6
+)
+
+# PNG version (for slides)
+ggsave(
+  filename = "output/fig_keyness_gender.png",
+  plot     = p_keyness,
+  width    = 8,
+  height   = 6,
+  dpi      = 300
+)
+
+```
+
+## **RQ2: Are there gender differences in how hawkish/dovish concepts are framed and contextualized?**
+
+**Dictionary-based hawkish/dovish tone**
+
+```{r Q2 Dictionary-based hawkish/dovish tone}
+## Q2 Dictionary-based hawkish/dovish tone ----------------------------
+
+# 1. Load Picault & Renault lexicon -----------------------------------
+
+lex <- read_delim("export_lexicon.csv", delim = ";")
+
+# Clean keyword for lookup
+lex <- lex %>%
+  mutate(keyword = str_trim(keyword)) %>%
+  mutate(keyword = quanteda::phrase(keyword))
+
+# 2. Build Monetary Policy Tone dictionary ----------------------------
+
+hawk_terms    <- lex %>% filter(mp_rest > 0.5) %>% pull(keyword)
+dove_terms    <- lex %>% filter(mp_acco > 0.5) %>% pull(keyword)
+neutral_terms <- lex %>% filter(mp_neut > 0.5) %>% pull(keyword)
+
+mp_dict <- dictionary(list(
+  hawk    = hawk_terms,
+  dove    = dove_terms,
+  neutral = neutral_terms
+))
+
+# 3. Build dfm for all speeches + attach Gender -----------------------
+
+dfm_all <- dfm(tokens_all)   
+docvars(dfm_all, "Gender") <- cbs_gender$Gender
+
+# 4. Apply monetary policy dictionary --------------------------------
+
+dfm_mp <- dfm_lookup(dfm_all, mp_dict, valuetype = "fixed")
+
+docvars(dfm_mp, "Gender") <- docvars(dfm_all, "Gender")
+
+# 5. Compute normalized tone scores per speech -----------------------
+
+token_counts <- ntoken(dfm_all)  # total tokens per speech (named vector)
+
+tone_scores <- convert(dfm_mp, to = "data.frame")
+
+# explicitly add Gender from docvars
+tone_scores$Gender <- docvars(dfm_mp, "Gender")
+
+tone_scores <- tone_scores %>%
+  mutate(
+    total_tokens = token_counts[doc_id],
+    hawk_norm    = ifelse(total_tokens > 0, hawk / total_tokens, 0),
+    dove_norm    = ifelse(total_tokens > 0, dove / total_tokens, 0),
+    net_tone     = hawk_norm - dove_norm
+  )
+
+# 6. Summarize tone by Gender ----------------------------------------
+
+tone_by_gender <- tone_scores %>%
+  group_by(Gender) %>%
+  summarise(
+    mean_hawk = mean(hawk_norm, na.rm = TRUE),
+    mean_dove = mean(dove_norm, na.rm = TRUE),
+    mean_net  = mean(net_tone,  na.rm = TRUE),
+    sd_net    = sd(net_tone,    na.rm = TRUE),
+    n         = n()
+  )
+
+tone_by_gender
+
+# 7. Test for gender differences in net tone -------------------------
+
+t.test(net_tone ~ Gender, data = tone_scores)
+
+# 8. Plot distribution of net tone by gender -------------------------
+
+p_tone <- ggplot(tone_scores, aes(x = Gender, y = net_tone, fill = Gender)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "Net Hawk–Dove Tone by Gender",
+    y = "Net tone (hawk_norm − dove_norm)",
+    x = ""
+  ) +
+  scale_fill_manual(values = c("Female" = "purple", "Male" = "steelblue"))
+
+ggsave(
+  filename = "output/fig_net_tone_by_gender.pdf",
+  plot     = p_tone,
+  width    = 6,
+  height   = 5
+)
+
+
+```
+
+**Keyness of hawkish/dovish terms**
+
+```{r Q2 Keyness of hawkish/dovish}
+
+# 1. Define simple hawkish / dovish terms 
+hawk_terms_simple <- c("rais", "hike", "tighten", "higher rate", "increas rate")
+dove_terms_simple <- c("cut", "ease", "accommod", "lower rate", "support", "stimulus")
+
+# 2. Hawkish contexts: keep ±5-word windows around hawkish terms ----------
+toks_hawk <- tokens_keep(
+  tokens_all,
+  pattern = hawk_terms_simple,
+  window  = 5
+)
+
+# 3. Dovish contexts: keep ±5-word windows around dovish terms ------------
+toks_dove <- tokens_keep(
+  tokens_all,
+  pattern = dove_terms_simple,
+  window  = 5
+)
+
+# 4. Build dfm for hawkish / dovish contexts ------------------------------
+dfm_hawk <- dfm(toks_hawk)
+dfm_dove <- dfm(toks_dove)
+
+## ---- Hawkish contexts: keyness by gender -------------------------------
+
+key_hawk <- textstat_keyness(
+  dfm_hawk,
+  target = cbs_gender$Gender == "Female"
+)
+
+# Top 20 distinctive words for each gender in hawkish contexts
+top_hawk_female <- key_hawk %>%
+  filter(chi2 > 0) %>%
+  slice_max(order_by = chi2, n = 20) %>%
+  mutate(direction = "Female")
+
+top_hawk_male <- key_hawk %>%
+  filter(chi2 < 0) %>%
+  slice_min(order_by = chi2, n = 20) %>%
+  mutate(direction = "Male")
+
+top_hawk_both <- bind_rows(top_hawk_female, top_hawk_male)
+
+p_hawk_keyness <- ggplot(top_hawk_both,
+       aes(x = reorder(feature, chi2),
+           y = chi2,
+           fill = direction)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Words Most Distinctive in Hawkish Contexts by Gender",
+    x = "Word",
+    y = "Keyness (chi-squared)",
+    fill = ""
+  ) +
+  scale_fill_manual(values = c("Female" = "purple", "Male" = "steelblue")) +
+  theme_minimal()
+
+ggsave(
+  filename = "output/fig_hawkish_keyness_gender.pdf",
+  plot     = p_hawk_keyness,
+  width    = 8,
+  height   = 6
+)
+## ---- Dovish contexts: keyness by gender --------------------------------
+
+key_dove <- textstat_keyness(
+  dfm_dove,
+  target = cbs_gender$Gender == "Female"
+)
+
+top_dove_female <- key_dove %>%
+  filter(chi2 > 0) %>%
+  slice_max(order_by = chi2, n = 20) %>%
+  mutate(direction = "Female")
+
+top_dove_male <- key_dove %>%
+  filter(chi2 < 0) %>%
+  slice_min(order_by = chi2, n = 20) %>%
+  mutate(direction = "Male")
+
+top_dove_both <- bind_rows(top_dove_female, top_dove_male)
+
+p_dove_keyness <- ggplot(top_dove_both,
+       aes(x = reorder(feature, chi2),
+           y = chi2,
+           fill = direction)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Words Most Distinctive in Dovish Contexts by Gender",
+    x = "Word",
+    y = "Keyness (chi-squared)",
+    fill = ""
+  ) +
+  scale_fill_manual(values = c("Female" = "purple", "Male" = "steelblue")) +
+  theme_minimal()
+
+ggsave(
+  filename = "output/fig_dovish_keyness_gender.pdf",
+  plot     = p_dove_keyness,
+  width    = 8,
+  height   = 6
+)
+
+
+```
+
+**Monetary-policy topic interaction**
+
+```{r Q2 topic interaction}
+
+library(stm)
+
+## 1. Prepare dfm for STM (trim very rare / very common terms) ------------
+
+dfm_all_trim <- dfm_trim(
+  dfm_all,
+  min_docfreq = 0.01,
+  max_docfreq = 0.90,
+  docfreq_type = "prop"
+)
+
+# Convert to STM format
+dfm_all_stm <- convert(dfm_all_trim, to = "stm")
+
+# 2. Build meta: align doc_id, Gender, and net_tone -----------------------
+
+meta <- data.frame(doc_id = dfm_all_stm$documents %>% names())
+
+meta <- data.frame(doc_id = docnames(dfm_all_trim))
+
+meta <- meta %>%
+  left_join(
+    tone_scores %>% select(doc_id, Gender, net_tone),
+    by = "doc_id"
+  )
+
+dfm_all_stm$meta <- meta
+
+## 3. Fit STM with K = 10 topics, prevalence ~ Gender ---------------------
+
+set.seed(321)
+
+stm_all <- stm(
+  documents  = dfm_all_stm$documents,
+  vocab      = dfm_all_stm$vocab,
+  data       = dfm_all_stm$meta,
+  K          = 10,
+  prevalence = ~ Gender,
+  init.type  = "Spectral"
+)
+
+## 4. Get topic proportions (theta) and dominant topic per document -------
+
+theta_all <- stm_all$theta  # rows = documents, cols = topics
+
+theta_df <- as.data.frame(theta_all)
+theta_df$doc_id <- dfm_all_stm$meta$doc_id
+theta_df$Gender <- dfm_all_stm$meta$Gender
+theta_df$net_tone <- dfm_all_stm$meta$net_tone
+
+# Dominant topic = topic with highest proportion
+theta_df$topic_id <- apply(theta_all, 1, which.max)
+
+## 5. Summarize mean net tone by topic and gender -------------------------
+
+topic_tone_summary <- theta_df %>%
+  group_by(topic_id, Gender) %>%
+  summarise(
+    mean_net_tone = mean(net_tone, na.rm = TRUE),
+    n             = n()
+  )
+
+topic_tone_summary
+
+## 6. Plot: net hawk–dove tone by topic × gender -------------------------
+
+# custom labels for topics 
+topic_labels <- c(
+  "Dev/Real Economy", "Inflation", "Climate/Green",
+  "Fed/Rate Policy", "Society/Labor", "Markets/Finance",
+  "Supervision/Regulation", "Fintech/Innovation",
+  "Eurozone/Global", "Monetary/Strategy"
+)
+
+topic_tone_summary$topic_label <- factor(
+  topic_tone_summary$topic_id,
+  levels = 1:10,
+  labels = topic_labels
+)
+
+p_topic_tone <- ggplot(topic_tone_summary,
+       aes(x = topic_label,
+           y = mean_net_tone,
+           fill = Gender)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Net Hawk–Dove Tone by Topic and Gender",
+    x = "Topic",
+    y = "Mean net tone (hawk − dove)"
+  ) +
+  scale_fill_manual(values = c("Female" = "purple", "Male" = "steelblue"))
+
+ggsave(
+  filename = "output/fig_topic_net_tone_gender.pdf",
+  plot     = p_topic_tone,
+  width    = 9,
+  height   = 6
+)
+
+
+
+```
+
+## **RQ3: What semantic neighborhoods surround inflation, growth, or stability for male vs. female speakers?**
+
+**Train single embedding model on full corpus**
+
+```{r Q3 single embedding}
+library(quanteda)
+library(text2vec)
+library(tidyverse)
+
+# 1. Corpus and tokens (full sample) ---------------------------------
+
+corp <- corpus(cbs_gender, text_field = "text")
+docvars(corp, "Gender") <- cbs_gender$Gender
+
+toks <- tokens(
+  corp,
+  remove_punct   = TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE,
+  remove_url     = TRUE
+) %>%
+  tokens_tolower() %>%
+  tokens_remove(stopwords("en")) %>%
+  tokens_wordstem(language = "en")
+
+# 2. Keep reasonably frequent terms and build dfm --------------------
+
+dfm_all <- dfm(toks) %>%
+  dfm_trim(min_termfreq = 20)    # tweak threshold as needed
+
+feats <- featnames(dfm_all)
+
+# Keep only those features in tokens, with padding so distances preserved
+toks_sel <- tokens_select(toks, pattern = feats, padding = TRUE)
+
+# 3. Feature-cooccurrence matrix (window = 5) ------------------------
+
+WINDOW <- 5
+fcm_mat <- fcm(
+  toks_sel,
+  context = "window",
+  window  = WINDOW,
+  count   = "frequency",
+  tri     = FALSE
+)
+
+# 4. Train GloVe on full corpus -------------------------------------
+
+DIM   <- 100
+glove <- GlobalVectors$new(rank = DIM, x_max = 10)
+
+wv_main <- glove$fit_transform(
+  fcm_mat,
+  n_iter          = 50,
+  convergence_tol = 1e-3
+)
+wv_ctx  <- glove$components
+
+# Final word vectors (word × DIM)
+word_vectors <- wv_main + t(wv_ctx)
+rownames(word_vectors) <- rownames(fcm_mat)
+dim(word_vectors)
+
+# 5. Helper: cosine similarity + nearest neighbors ------------------
+
+cos_sim_vec <- function(mat, vec) {
+  num   <- mat %*% vec
+  denom <- sqrt(rowSums(mat^2)) * sqrt(sum(vec^2))
+  as.numeric(num / denom)
+}
+
+nearest_words <- function(word_vectors, center_vec, top_n = 15, exclude = NULL) {
+  sims <- cos_sim_vec(word_vectors, center_vec)
+  names(sims) <- rownames(word_vectors)
+  if (!is.null(exclude)) sims[exclude] <- NA
+  sort(sims, decreasing = TRUE)[1:top_n]
+}
+
+# 6. Build gender-specific CONTEXT vectors for each keyword ----------
+
+get_context_vector <- function(keyword_stem,
+                               gender_value,
+                               window    = 10,
+                               min_count = 5) {
+  idx    <- docvars(corp, "Gender") == gender_value
+  toks_g <- toks[idx]
+  
+  # contexts around keyword_stem
+  toks_ctx <- tokens_keep(
+    toks_g,
+    pattern = keyword_stem,
+    window  = window
+  )
+  
+  # remove discourse function words that dominated earlier results
+  discourse_sw <- c(
+    "also","however","thus","well","second",
+    "moreov","although","therefor","fact","addit",
+    "current","term","turn","import","earlier"
+  )
+  
+  dfm_ctx <- dfm(toks_ctx) %>%
+    dfm_remove(stopwords("en")) %>%
+    dfm_remove(discourse_sw)
+  
+  if (nfeat(dfm_ctx) == 0) return(NULL)
+  
+  counts <- colSums(dfm_ctx)
+  counts <- counts[counts >= min_count]
+  if (length(counts) == 0) return(NULL)
+  
+  vocab_emb <- intersect(names(counts), rownames(word_vectors))
+  counts    <- counts[vocab_emb]
+  if (length(counts) == 0) return(NULL)
+  
+  weights <- counts / sum(counts)
+  mat     <- word_vectors[vocab_emb, , drop = FALSE]
+  
+  as.numeric(t(weights) %*% mat)   # weighted average context vector
+}
+
+# 7. Inspect semantic neighbors by gender in single embedding space --
+
+key_terms <- c("tighten", "accommod", "inflat", "growth", "stabil")
+
+neighbors_by_gender <- list()
+
+for (w in key_terms) {
+  cat("\n====================\nKEYWORD:", w, "\n")
+  
+  v_f <- get_context_vector(w, "Female", window = 10, min_count = 5)
+  v_m <- get_context_vector(w, "Male",   window = 10, min_count = 5)
+  
+  if (is.null(v_f) | is.null(v_m)) {
+    cat("Not enough contexts for this word.\n")
+    next
+  }
+  
+  neigh_f <- nearest_words(word_vectors, v_f, top_n = 15, exclude = w)
+  neigh_m <- nearest_words(word_vectors, v_m, top_n = 15, exclude = w)
+  
+  neighbors_by_gender[[w]] <- list(
+    female = neigh_f,
+    male   = neigh_m
+  )
+  
+  cat("\nFemale neighbors:\n")
+  print(neigh_f)
+  cat("\nMale neighbors:\n")
+  print(neigh_m)
+}
+
+
+```
+
+**Train separate embeddings on male vs female corpora**
+
+```{r Q3 separate embeddings}
+library(quanteda)
+library(text2vec)
+library(dplyr)
+library(purrr)
+
+# 1. Build separate corpora for Female and Male ----------------------
+
+corp <- corpus(cbs_gender, text_field = "text")
+
+corp_f <- corpus_subset(corp, Gender == "Female")
+corp_m <- corpus_subset(corp, Gender == "Male")
+
+# 2. Tokenize (consistent with earlier pipeline) ---------------------
+
+toks_f <- tokens(
+  corp_f,
+  remove_punct   = TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE,
+  remove_url     = TRUE
+) %>%
+  tokens_tolower() %>%
+  tokens_remove(stopwords("en")) %>%
+  tokens_wordstem(language = "en")
+
+toks_m <- tokens(
+  corp_m,
+  remove_punct   = TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE,
+  remove_url     = TRUE
+) %>%
+  tokens_tolower() %>%
+  tokens_remove(stopwords("en")) %>%
+  tokens_wordstem(language = "en")
+
+# 3. Keep reasonably frequent features -------------------------------
+
+dfm_f <- dfm(toks_f) %>%
+  dfm_trim(min_termfreq = 20)
+
+dfm_m <- dfm(toks_m) %>%
+  dfm_trim(min_termfreq = 20)
+
+feat_f <- featnames(dfm_f)
+feat_m <- featnames(dfm_m)
+
+# re-select tokens to only keep frequent features, with padding
+toks_f <- tokens_select(toks_f, feat_f, padding = TRUE)
+toks_m <- tokens_select(toks_m, feat_m, padding = TRUE)
+
+# 4. Build feature co-occurrence matrices ----------------------------
+
+WINDOW_SIZE <- 5
+DIM         <- 100
+ITERS       <- 50
+
+fcm_f <- fcm(toks_f, context = "window", window = WINDOW_SIZE, tri = FALSE)
+fcm_m <- fcm(toks_m, context = "window", window = WINDOW_SIZE, tri = FALSE)
+
+# 5. Train two GloVe models: Female-only, Male-only -----------------
+
+glove_f <- GlobalVectors$new(rank = DIM, x_max = 10, learning_rate = 0.05)
+glove_m <- GlobalVectors$new(rank = DIM, x_max = 10, learning_rate = 0.05)
+
+set.seed(123)
+
+wv_f_main <- glove_f$fit_transform(
+  fcm_f,
+  n_iter          = ITERS,
+  convergence_tol = 1e-3,
+  n_threads       = parallel::detectCores()
+)
+wv_f_ctxt <- glove_f$components
+
+wv_m_main <- glove_m$fit_transform(
+  fcm_m,
+  n_iter          = ITERS,
+  convergence_tol = 1e-3,
+  n_threads       = parallel::detectCores()
+)
+wv_m_ctxt <- glove_m$components
+
+# Combine main + context vectors (standard GloVe trick)
+W_female <- wv_f_main + t(wv_f_ctxt)
+W_male   <- wv_m_main + t(wv_m_ctxt)
+
+rownames(W_female) <- rownames(fcm_f)
+rownames(W_male)   <- rownames(fcm_m)
+
+# 6. Helper: cosine similarity + nearest neighbors ------------------
+
+cos_sim_vec <- function(M, v) {
+  M <- as.matrix(M)
+  v <- as.numeric(v)
+  num   <- as.vector(M %*% v)
+  denom <- sqrt(rowSums(M^2)) * sqrt(sum(v^2))
+  num / denom
+}
+
+nearest_words <- function(W, term, n = 10) {
+  if (!term %in% rownames(W)) {
+    warning("Term '", term, "' not found in vocabulary.")
+    return(tibble(word = character(), similarity = numeric()))
+  }
+  v <- W[term, , drop = FALSE]
+  sims <- cos_sim_vec(W, v)
+  tibble(
+    word = names(sims),
+    similarity = sims
+  ) %>%
+    arrange(desc(similarity)) %>%
+    slice_head(n = n)
+}
+
+# 7. Get nearest neighbors for key stems by gender ------------------
+
+terms <- c("tighten", "inflat", "stabil")  # stemmed keywords
+
+neighbors_female <- map_dfr(
+  terms,
+  function(term) {
+    nearest_words(W_female, term, n = 8) %>%
+      mutate(keyword = term, Gender = "Female")
+  }
+)
+
+neighbors_male <- map_dfr(
+  terms,
+  function(term) {
+    nearest_words(W_male, term, n = 8) %>%
+      mutate(keyword = term, Gender = "Male")
+  }
+)
+
+neighbors_all <- bind_rows(neighbors_female, neighbors_male) %>%
+  relocate(Gender, keyword, word, similarity)
+
+neighbors_all
+
+## Q3 Visualization: 'tighten' – single vs separate embeddings -----------
+
+library(dplyr)
+library(ggplot2)
+library(tidytext)   
+
+## --- Helper for single embedding model ---------------------------------
+
+nearest_words_single <- function(word_vectors, center_vec, n = 10, exclude = NULL) {
+  sims <- cos_sim_vec(word_vectors, center_vec)
+  names(sims) <- rownames(word_vectors)
+  if (!is.null(exclude)) sims[exclude] <- NA
+  sort(sims, decreasing = TRUE)[1:n]
+}
+
+## --- Helper for separate embeddings ------------------------------------
+
+nearest_words_sep <- function(W, term, n = 10) {
+  if (!term %in% rownames(W)) {
+    warning("Term '", term, "' not found in vocabulary.")
+    return(tibble(word = character(), similarity = numeric()))
+  }
+  v <- W[term, , drop = FALSE]
+  sims <- cos_sim_vec(W, v)
+  tibble(
+    word = names(sims),
+    similarity = sims
+  ) %>%
+    arrange(desc(similarity)) %>%
+    slice_head(n = n)
+}
+
+## ========== 1. SINGLE EMBEDDING APPROACH ===============================
+
+v_f_single <- get_context_vector("tighten", "Female", window = 10, min_count = 5)
+v_m_single <- get_context_vector("tighten", "Male",   window = 10, min_count = 5)
+
+neigh_f_single <- nearest_words_single(word_vectors, v_f_single, n = 10, exclude = "tighten")
+neigh_m_single <- nearest_words_single(word_vectors, v_m_single, n = 10, exclude = "tighten")
+
+df_single_f <- tibble(
+  word       = names(neigh_f_single),
+  similarity = as.numeric(neigh_f_single),
+  Gender     = "Female",
+  Approach   = "Single embedding (context)"
+)
+
+df_single_m <- tibble(
+  word       = names(neigh_m_single),
+  similarity = as.numeric(neigh_m_single),
+  Gender     = "Male",
+  Approach   = "Single embedding (context)"
+)
+
+df_single <- bind_rows(df_single_f, df_single_m)
+
+
+## ========== 2. SEPARATE EMBEDDING APPROACH =============================
+
+neigh_f_sep <- nearest_words_sep(W_female, "tighten", n = 10) %>%
+  mutate(Gender = "Female", Approach = "Separate embeddings")
+
+neigh_m_sep <- nearest_words_sep(W_male, "tighten", n = 10) %>%
+  mutate(Gender = "Male",   Approach = "Separate embeddings")
+
+df_sep <- bind_rows(neigh_f_sep, neigh_m_sep)
+
+
+## ========== 3. Combine + Visualize =====================================
+
+neighbors_tighten <- bind_rows(df_single, df_sep)
+
+neighbors_tighten_top <- neighbors_tighten %>%
+  group_by(Approach, Gender) %>%
+  slice_max(order_by = similarity, n = 10) %>%
+  ungroup()
+
+p_tighten_compare <- ggplot(neighbors_tighten_top,
+       aes(x = similarity,
+           y = reorder_within(word, similarity, interaction(Approach, Gender)),
+           fill = Gender)) +
+  geom_col(show.legend = FALSE) +
+  facet_grid(Approach ~ Gender, scales = "free_y") +
+  scale_y_reordered() +
+  labs(
+    title = "Semantic neighbors of 'tighten': single vs separate embeddings",
+    x = "Cosine similarity",
+    y = NULL
+  ) +
+  theme_minimal()
+
+ggsave("output/fig_neighbors_tighten_compare.pdf", p_tighten_compare, width = 10, height = 7)
+
+p_tighten_single <- ggplot(df_single,
+       aes(x = similarity,
+           y = reorder_within(word, similarity, Gender),
+           fill = Gender)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Gender, scales = "free_y") +
+  scale_y_reordered() +
+  labs(
+    title = "Single Embedding Model: Semantic Neighbors of 'tighten'",
+    x = "Cosine similarity",
+    y = NULL
+  ) +
+  theme_minimal()
+ggsave("output/fig_neighbors_tighten_single.pdf", p_tighten_single, width = 9, height = 6)
+
+
+p_tighten_sep <- ggplot(df_sep,
+       aes(x = similarity,
+           y = reorder_within(word, similarity, Gender),
+           fill = Gender)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Gender, scales = "free_y") +
+  scale_y_reordered() +
+  labs(
+    title = "Separate Embeddings: Semantic Neighbors of 'tighten'",
+    x = "Cosine similarity",
+    y = NULL
+  ) +
+  theme_minimal()
+ggsave("output/fig_neighbors_tighten_separate.pdf", p_tighten_sep, width = 9, height = 6)
+
+```
+
+**Use cosine similarity to quantify meaning shifts**
+
+```{r Q3 cosine similarity}
+library(ggplot2)
+library(tidyr)
+library(ggrepel)
+library(tidytext)   
+
+# 1. Visualize top neighbors per keyword × gender  ---
+
+neighbors_top <- neighbors_all %>%
+  group_by(keyword, Gender) %>%
+  slice_max(order_by = similarity, n = 8) %>%
+  ungroup()
+
+ggplot(neighbors_top,
+       aes(x = similarity,
+           y = reorder_within(word, similarity, interaction(keyword, Gender)),
+           fill = Gender)) +
+  geom_col(show.legend = FALSE) +
+  facet_grid(Gender ~ keyword, scales = "free_y") +
+  scale_y_reordered() +
+  labs(
+    title = "Semantic Neighbors of Key Monetary Terms by Gender",
+    x = "Cosine similarity to keyword",
+    y = NULL
+  ) +
+  theme_minimal()
+
+# 2. Build Female vs Male similarity table for each keyword ----------
+
+compare_keyword <- function(keyword, data = neighbors_all, top_n = 200) {
+  data %>%
+    filter(keyword == !!keyword) %>%
+    select(word, Gender, similarity) %>%
+    tidyr::pivot_wider(
+      names_from  = Gender,
+      values_from = similarity,
+      values_fill = 0
+    ) %>%
+    rename(
+      Female_sim = Female,
+      Male_sim   = Male
+    ) %>%
+    arrange(desc(pmax(Female_sim, Male_sim))) %>%
+    slice_head(n = top_n) %>%
+    mutate(keyword = keyword)
+}
+
+df_compare_inflat  <- compare_keyword("inflat",  top_n = 200)
+df_compare_stabil  <- compare_keyword("stabil",  top_n = 200)
+df_compare_tighten <- compare_keyword("tighten", top_n = 200)
+
+# 3. Scatterplot: Female vs Male similarity for one keyword ----------
+
+ggplot(df_compare_tighten,
+       aes(x = Female_sim, y = Male_sim, label = word)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 40) +
+  labs(
+    title = "Female vs Male semantic similarity for 'tighten'",
+    subtitle = "Each point is a neighbor word in local GloVe spaces",
+    x = "Similarity in Female embeddings",
+    y = "Similarity in Male embeddings"
+  ) +
+  theme_minimal()
+
+# 4. Largest shifts: Female_sim − Male_sim ---------------------------
+
+df_diff_tighten <- df_compare_tighten %>%
+  mutate(diff = Female_sim - Male_sim) %>%
+  arrange(desc(abs(diff))) %>%
+  slice_head(n = 50)
+
+p_tighten_shift <- ggplot(df_diff_tighten,
+       aes(x = reorder(word, diff), y = diff, fill = diff > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("TRUE" = "tomato", "FALSE" = "steelblue"),
+    labels = c("Female > Male", "Male > Female")
+  ) +
+  labs(
+    title = "Largest Female–Male semantic shifts for 'tighten'",
+    x = "Word",
+    y = "Female similarity − Male similarity",
+    fill = "Shift direction"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = "output/fig_semantic_shift_tighten.pdf",
+  plot     = p_tighten_shift,
+  width    = 8,
+  height   = 6
+)
+
+# 5. Extract lists of words more Female- or Male-associated ----------
+
+df_compare_inflat_filtered <- df_compare_inflat %>%
+  mutate(diff = abs(Female_sim - Male_sim)) %>%
+  arrange(desc(diff)) %>%
+  slice_head(n = 50)
+
+# Words more strongly associated with inflation for women
+female_inflat_words <- df_compare_inflat_filtered %>%
+  arrange(desc(Female_sim - Male_sim)) %>%
+  slice_head(n = 30) %>%
+  pull(word)
+
+female_inflat_words
+
+# Words more strongly associated with inflation for men
+male_inflat_words <- df_compare_inflat_filtered %>%
+  arrange(Female_sim - Male_sim) %>%
+  slice_head(n = 30) %>%
+  pull(word)
+
+male_inflat_words
+
+
+```
